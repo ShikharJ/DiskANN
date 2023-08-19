@@ -12,6 +12,13 @@ enum Metric
     FAST_L2 = 3
 };
 
+enum Clause
+{
+    AND = 0,
+    OR = 1,
+    NOT = 2
+};
+
 template <typename T> class Distance
 {
   public:

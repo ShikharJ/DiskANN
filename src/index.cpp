@@ -1453,7 +1453,7 @@ void Index<T, TagT, LabelT>::link(const IndexWriteParameters &parameters)
 
     diskann::Timer link_timer;
 
-#pragma omp parallel for schedule(dynamic, 2048)
+#pragma omp parallel for schedule(static, 2048)
     for (int64_t node_ctr = 0; node_ctr < (int64_t)(visit_order.size()); node_ctr++)
     {
         auto node = visit_order[node_ctr];
@@ -1491,7 +1491,7 @@ void Index<T, TagT, LabelT>::link(const IndexWriteParameters &parameters)
     {
         diskann::cout << "Starting final cleanup.." << std::flush;
     }
-#pragma omp parallel for schedule(dynamic, 2048)
+#pragma omp parallel for schedule(static, 1)
     for (int64_t node_ctr = 0; node_ctr < (int64_t)(visit_order.size()); node_ctr++)
     {
         auto node = visit_order[node_ctr];
@@ -2589,7 +2589,7 @@ consolidation_report Index<T, TagT, LabelT>::consolidate_deletes(const IndexWrit
 
     uint32_t num_calls_to_process_delete = 0;
     diskann::Timer timer;
-#pragma omp parallel for num_threads(num_threads) schedule(dynamic, 8192) reduction(+ : num_calls_to_process_delete)
+#pragma omp parallel for num_threads(num_threads) schedule(static, 8192) reduction(+ : num_calls_to_process_delete)
     for (int64_t loc = 0; loc < (int64_t)_max_points; loc++)
     {
         if (old_delete_set->find((uint32_t)loc) == old_delete_set->end() && !_empty_slots.is_in_set((uint32_t)loc))

@@ -123,6 +123,70 @@ void inner_prod_to_points(const size_t dim,
         delete[] ones_vec;
 }
 
+inline bool matches_query_clause(const diskann::Clause &clause, uint32_t *point_filters, uint32_t *query_filters,
+                                 size_t point_index, size_t query_index, size_t multiplicity)
+{
+    size_t k = 0;
+    uint32_t *curr_point = point_filters + (multiplicity * point_index);
+    uint32_t *curr_query = query_filters + (multiplicity * query_index);
+
+    if (clause == diskann::Clause::AND)
+    {
+        for (size_t i = 0; i < multiplicity; i++)
+        {
+            bool local_result = false;
+            uint32_t curr_filter = curr_query[i];
+            for (size_t j = k; j < multiplicity; j++)
+            {
+                if (curr_point[j] == curr_filter)
+                {
+                    local_result = true;
+                    k = j + 1;
+                    break;
+                }
+                else if (curr_point[j] > curr_filter)
+                {
+                    k = j;
+                    break;
+                }
+            }
+            if (!local_result)
+                return false;
+        }
+        return true;
+    }
+    else if (clause == diskann::Clause::OR)
+    {
+        for (size_t i = 0; i < multiplicity; i++)
+        {
+            uint32_t curr_filter = curr_query[i];
+            for (size_t j = k; j < multiplicity; j++)
+            {
+                if (curr_point[j] == curr_filter)
+                {
+                    return true;
+                }
+                else if (curr_point[j] > curr_filter)
+                {
+                    k = j;
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+    else
+    {
+        uint32_t curr_filter = *curr_query;
+        for (size_t j = k; j < multiplicity; j++)
+        {
+            if (curr_point[j] == curr_filter)
+                return false;
+        }
+        return true;
+    }
+}
+
 void exact_knn(const size_t dim, const size_t k,
                size_t *const closest_points,     // k * num_queries preallocated, col
                                                  // major, queries columns
@@ -130,9 +194,12 @@ void exact_knn(const size_t dim, const size_t k,
                                                  // preallocated, Dist to
                                                  // corresponding closes_points
                size_t npoints,
-               float *points_in, // points in Col major
-               size_t nqueries, float *queries_in,
-               diskann::Metric metric = diskann::Metric::L2) // queries in Col major
+               float *points_in,                   // points in Col major
+               uint32_t *point_filters,            // filters of each point
+               size_t nqueries, float *queries_in, // queries in Col major
+               uint32_t *query_filters,            // filters of each query
+               size_t total_points, diskann::Metric metric = diskann::Metric::L2,
+               diskann::Clause clause = diskann::Clause::AND, size_t multiplicity = 2)
 {
     float *points_l2sq = new float[npoints];
     float *queries_l2sq = new float[nqueries];
@@ -209,27 +276,57 @@ void exact_knn(const size_t dim, const size_t k,
         }
         std::cout << "Computed distances for queries: [" << q_b << "," << q_e << ")" << std::endl;
 
-#pragma omp parallel for schedule(dynamic, 16)
-        for (long long q = q_b; q < q_e; q++)
+        if (query_filters == nullptr)
         {
-            maxPQIFCS point_dist;
-            for (size_t p = 0; p < k; p++)
-                point_dist.emplace(p, dist_matrix[(ptrdiff_t)p + (ptrdiff_t)(q - q_b) * (ptrdiff_t)npoints]);
-            for (size_t p = k; p < npoints; p++)
+#pragma omp parallel for schedule(dynamic, 16)
+            for (long long q = q_b; q < q_e; q++)
             {
-                if (point_dist.top().second > dist_matrix[(ptrdiff_t)p + (ptrdiff_t)(q - q_b) * (ptrdiff_t)npoints])
+                maxPQIFCS point_dist;
+                for (size_t p = 0; p < k; p++)
                     point_dist.emplace(p, dist_matrix[(ptrdiff_t)p + (ptrdiff_t)(q - q_b) * (ptrdiff_t)npoints]);
-                if (point_dist.size() > k)
+                for (size_t p = k; p < npoints; p++)
+                {
+                    if (point_dist.top().second > dist_matrix[(ptrdiff_t)p + (ptrdiff_t)(q - q_b) * (ptrdiff_t)npoints])
+                        point_dist.emplace(p, dist_matrix[(ptrdiff_t)p + (ptrdiff_t)(q - q_b) * (ptrdiff_t)npoints]);
+                    if (point_dist.size() > k)
+                        point_dist.pop();
+                }
+                for (ptrdiff_t l = 0; l < (ptrdiff_t)k; ++l)
+                {
+                    closest_points[(ptrdiff_t)(k - 1 - l) + (ptrdiff_t)q * (ptrdiff_t)k] = point_dist.top().first;
+                    dist_closest_points[(ptrdiff_t)(k - 1 - l) + (ptrdiff_t)q * (ptrdiff_t)k] = point_dist.top().second;
                     point_dist.pop();
+                }
+                assert(std::is_sorted(dist_closest_points + (ptrdiff_t)q * (ptrdiff_t)k,
+                                      dist_closest_points + (ptrdiff_t)(q + 1) * (ptrdiff_t)k));
             }
-            for (ptrdiff_t l = 0; l < (ptrdiff_t)k; ++l)
+        }
+        else
+        {
+#pragma omp parallel for schedule(dynamic, 16)
+            for (long long q = q_b; q < q_e; q++)
             {
-                closest_points[(ptrdiff_t)(k - 1 - l) + (ptrdiff_t)q * (ptrdiff_t)k] = point_dist.top().first;
-                dist_closest_points[(ptrdiff_t)(k - 1 - l) + (ptrdiff_t)q * (ptrdiff_t)k] = point_dist.top().second;
-                point_dist.pop();
+                maxPQIFCS point_dist;
+                for (size_t p = 0; p < k; p++)
+                    point_dist.emplace(total_points, std::numeric_limits<float>::max());
+                for (size_t p = 0; p < npoints; p++)
+                {
+                    if (!matches_query_clause(clause, point_filters, query_filters, p, q, multiplicity))
+                        continue;
+                    if (point_dist.top().second > dist_matrix[(ptrdiff_t)p + (ptrdiff_t)(q - q_b) * (ptrdiff_t)npoints])
+                        point_dist.emplace(p, dist_matrix[(ptrdiff_t)p + (ptrdiff_t)(q - q_b) * (ptrdiff_t)npoints]);
+                    if (point_dist.size() > k)
+                        point_dist.pop();
+                }
+                for (ptrdiff_t l = 0; l < (ptrdiff_t)k; ++l)
+                {
+                    closest_points[(ptrdiff_t)(k - 1 - l) + (ptrdiff_t)q * (ptrdiff_t)k] = point_dist.top().first;
+                    dist_closest_points[(ptrdiff_t)(k - 1 - l) + (ptrdiff_t)q * (ptrdiff_t)k] = point_dist.top().second;
+                    point_dist.pop();
+                }
+                assert(std::is_sorted(dist_closest_points + (ptrdiff_t)q * (ptrdiff_t)k,
+                                      dist_closest_points + (ptrdiff_t)(q + 1) * (ptrdiff_t)k));
             }
-            assert(std::is_sorted(dist_closest_points + (ptrdiff_t)q * (ptrdiff_t)k,
-                                  dist_closest_points + (ptrdiff_t)(q + 1) * (ptrdiff_t)k));
         }
         std::cout << "Computed exact k-NN for queries: [" << q_b << "," << q_e << ")" << std::endl;
     }
@@ -335,26 +432,49 @@ inline void save_groundtruth_as_one_file(const std::string filename, int32_t *da
 }
 
 template <typename T>
-std::vector<std::vector<std::pair<uint32_t, float>>> processUnfilteredParts(const std::string &base_file,
-                                                                            size_t &nqueries, size_t &npoints,
-                                                                            size_t &dim, size_t &k, float *query_data,
-                                                                            const diskann::Metric &metric,
-                                                                            std::vector<uint32_t> &location_to_tag)
+std::vector<std::vector<std::pair<uint32_t, float>>> processParts(
+    const std::string &base_file, const std::string &base_filters_file, const std::string &query_filters_file,
+    size_t &nqueries, size_t &npoints, size_t &dim, size_t &k, float *query_data, const diskann::Metric &metric,
+    const diskann::Clause &clause, std::vector<uint32_t> &location_to_tag)
 {
+    size_t tnp, np, nq, mpty;
     float *base_data = nullptr;
+    uint32_t *base_filters_data = nullptr;
+    uint32_t *query_filters_data = nullptr;
     int num_parts = get_num_parts<T>(base_file.c_str());
+    diskann::get_bin_metadata(base_file, tnp, dim);
     std::vector<std::vector<std::pair<uint32_t, float>>> res(nqueries);
+
+    if (query_filters_file != "")
+    {
+        diskann::load_bin<uint32_t>(query_filters_file.c_str(), query_filters_data, nq, mpty, 0);
+        if (nqueries != nq)
+        {
+            std::cout << "Incorrect query data and filters file provided!!! Exiting..." << std::endl;
+            exit(-1);
+        }
+    }
+
     for (int p = 0; p < num_parts; p++)
     {
         size_t start_id = p * PARTSIZE;
         load_bin_as_float<T>(base_file.c_str(), base_data, npoints, dim, p);
+        if (query_filters_file != "")
+        {
+            diskann::load_bin<uint32_t>(base_filters_file.c_str(), base_filters_data, np, mpty, p);
+            if (npoints != np)
+            {
+                std::cout << "Incorrect base data and filters file provided!!! Exiting..." << std::endl;
+                exit(-1);
+            }
+        }
 
         size_t *closest_points_part = new size_t[nqueries * k];
         float *dist_closest_points_part = new float[nqueries * k];
 
         auto part_k = k < npoints ? k : npoints;
-        exact_knn(dim, part_k, closest_points_part, dist_closest_points_part, npoints, base_data, nqueries, query_data,
-                  metric);
+        exact_knn(dim, part_k, closest_points_part, dist_closest_points_part, npoints, base_data, base_filters_data,
+                  nqueries, query_data, query_filters_data, tnp, metric, clause, mpty);
 
         for (size_t i = 0; i < nqueries; i++)
         {
@@ -373,13 +493,16 @@ std::vector<std::vector<std::pair<uint32_t, float>>> processUnfilteredParts(cons
         delete[] dist_closest_points_part;
 
         diskann::aligned_free(base_data);
+        diskann::aligned_free(base_filters_data);
     }
+    diskann::aligned_free(query_filters_data);
     return res;
 };
 
 template <typename T>
-int aux_main(const std::string &base_file, const std::string &query_file, const std::string &gt_file, size_t k,
-             const diskann::Metric &metric, const std::string &tags_file = std::string(""))
+int aux_main(const std::string &base_file, const std::string &base_filters_file, const std::string &query_file,
+             const std::string &query_filters_file, const std::string &gt_file, size_t k, const diskann::Metric &metric,
+             const diskann::Clause &clause, const std::string &tags_file = std::string(""))
 {
     size_t npoints, nqueries, dim;
 
@@ -397,8 +520,9 @@ int aux_main(const std::string &base_file, const std::string &query_file, const 
     int *closest_points = new int[nqueries * k];
     float *dist_closest_points = new float[nqueries * k];
 
-    std::vector<std::vector<std::pair<uint32_t, float>>> results =
-        processUnfilteredParts<T>(base_file, nqueries, npoints, dim, k, query_data, metric, location_to_tag);
+    std::vector<std::vector<std::pair<uint32_t, float>>> results;
+    results = processParts<T>(base_file, base_filters_file, query_filters_file, nqueries, npoints, dim, k, query_data,
+                              metric, clause, location_to_tag);
 
     for (size_t i = 0; i < nqueries; i++)
     {
@@ -489,7 +613,8 @@ void load_truthset(const std::string &bin_file, uint32_t *&ids, float *&dists, s
 
 int main(int argc, char **argv)
 {
-    std::string data_type, dist_fn, base_file, query_file, gt_file, tags_file;
+    std::string data_type, filter_type, dist_fn, base_file, base_filters_file, query_file, query_filters_file, gt_file,
+        tags_file;
     uint64_t K;
 
     try
@@ -502,8 +627,16 @@ int main(int argc, char **argv)
         desc.add_options()("dist_fn", po::value<std::string>(&dist_fn)->required(), "distance function <l2/mips>");
         desc.add_options()("base_file", po::value<std::string>(&base_file)->required(),
                            "File containing the base vectors in binary format");
+        desc.add_options()("base_filters_file",
+                           po::value<std::string>(&base_filters_file)->default_value(std::string()),
+                           "File containing the base vector filters in binary format");
         desc.add_options()("query_file", po::value<std::string>(&query_file)->required(),
                            "File containing the query vectors in binary format");
+        desc.add_options()("query_filters_file",
+                           po::value<std::string>(&query_filters_file)->default_value(std::string()),
+                           "File containing the query vector filters in binary format");
+        desc.add_options()("filters_type", po::value<std::string>(&filter_type)->default_value(std::string("AND")),
+                           "filter type <AND/OR/NOT>");
         desc.add_options()("gt_file", po::value<std::string>(&gt_file)->required(),
                            "File name for the writing ground truth in binary "
                            "format, please don' append .bin at end if "
@@ -555,14 +688,43 @@ int main(int argc, char **argv)
         return -1;
     }
 
+    if (base_filters_file == "" && query_filters_file != "")
+    {
+        std::cerr << "Base filters file should be provided when the query filters file is provided" << std::endl;
+        return -1;
+    }
+
+    diskann::Clause clause;
+    if (filter_type == std::string("AND"))
+    {
+        clause = diskann::Clause::AND;
+    }
+    else if (filter_type == std::string("OR"))
+    {
+        clause = diskann::Clause::OR;
+    }
+    else if (filter_type == std::string("NOT"))
+    {
+        clause = diskann::Clause::NOT;
+    }
+    else
+    {
+        std::cerr << "Unsupported filter connective. Use AND/OR/NOT only. Compound clauses currently unsupported"
+                  << std::endl;
+        return -1;
+    }
+
     try
     {
         if (data_type == std::string("float"))
-            aux_main<float>(base_file, query_file, gt_file, K, metric, tags_file);
+            aux_main<float>(base_file, base_filters_file, query_file, query_filters_file, gt_file, K, metric, clause,
+                            tags_file);
         if (data_type == std::string("int8"))
-            aux_main<int8_t>(base_file, query_file, gt_file, K, metric, tags_file);
+            aux_main<int8_t>(base_file, base_filters_file, query_file, query_filters_file, gt_file, K, metric, clause,
+                             tags_file);
         if (data_type == std::string("uint8"))
-            aux_main<uint8_t>(base_file, query_file, gt_file, K, metric, tags_file);
+            aux_main<uint8_t>(base_file, base_filters_file, query_file, query_filters_file, gt_file, K, metric, clause,
+                              tags_file);
     }
     catch (const std::exception &e)
     {
